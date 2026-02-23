@@ -1,8 +1,7 @@
 import asyncio
-import json
 import re
 from datetime import datetime, timezone
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
 from apify import Actor
 from bs4 import BeautifulSoup
@@ -11,7 +10,12 @@ from curl_cffi.requests import Session
 SITE_HOST = 'www.providentmetals.com'
 SITE_HOSTS = {'providentmetals.com', 'www.providentmetals.com'}
 BASE_URL = 'https://www.providentmetals.com'
-SEARCH_URL_TEMPLATE = 'https://www.providentmetals.com/search/?q={query}'
+SEARCH_URL_TEMPLATE = 'https://www.providentmetals.com/?s={query}'
+
+# SearchSpring API (Provident Metals uses SearchSpring for search)
+SEARCHSPRING_SITE_ID = '46h6lo'
+SEARCHSPRING_SEARCH_URL = 'https://api.searchspring.net/api/search/search.json'
+
 AVAILABILITY_STATES = ['In Stock', 'Out of Stock', 'Pre-Order', 'Sold Out', 'Coming Soon', 'Discontinued']
 MAX_DESCRIPTION_LENGTH = 2000
 SKIP_PATH_SEGMENTS = ['/about/', '/contact/', '/faq/', '/help/', '/blog/', '/my-account/', '/cart/', '/checkout/', '/shipping/', '/privacy/', '/terms/', '/customer-service/']
@@ -42,7 +46,7 @@ def validate_url(url: str) -> bool:
 
 
 def is_search_url(url: str) -> bool:
-    return '/search/' in url or '/search?' in url or 'q=' in url
+    return '/search/' in url or '/search?' in url or '?s=' in url or '&s=' in url or 'q=' in url
 
 
 def is_category_url(url: str) -> bool:
@@ -52,9 +56,7 @@ def is_category_url(url: str) -> bool:
     path = parsed.path.lower().strip('/')
     if not path:
         return True
-    # Provident Metals categories: /silver.html, /gold.html, /silver/silver-coins/1-oz-silver-coins.html
     top_categories = ('silver', 'gold', 'platinum', 'palladium', 'copper')
-    # Check for top-level category pages like /silver.html
     for cat in top_categories:
         if path == f'{cat}.html' or path.startswith(f'{cat}/'):
             return True
@@ -76,14 +78,93 @@ def is_product_url(url: str) -> bool:
         return False
     if is_category_url(url):
         return False
-    # Provident products: /{slug}.html or /{category}/{slug}.html
     if path.endswith('.html'):
         return True
-    # Also accept slug-only paths
     segments = [s for s in path.split('/') if s]
     if len(segments) == 1 and '.' not in segments[0]:
         return True
     return False
+
+
+def search_searchspring(http: Session, query: str, proxies: dict, results_per_page: int = 48, page: int = 1) -> list[dict]:
+    """Query the SearchSpring API to get Provident Metals search results."""
+    params = {
+        'siteId': SEARCHSPRING_SITE_ID,
+        'q': query,
+        'resultsPerPage': str(results_per_page),
+        'page': str(page),
+        'resultsFormat': 'native',
+    }
+    try:
+        resp = http.get(SEARCHSPRING_SEARCH_URL, params=params, proxies=proxies, timeout=30)
+        if resp.status_code != 200:
+            Actor.log.warning(f"SearchSpring API returned {resp.status_code}")
+            return []
+        data = resp.json()
+    except Exception as e:
+        Actor.log.error(f"SearchSpring API request failed: {e}")
+        return []
+
+    total = data.get('pagination', {}).get('totalResults', 0)
+    raw_results = data.get('results', [])
+    Actor.log.info(f"SearchSpring API: {total} total results, got {len(raw_results)} (page {page})")
+
+    products = []
+    for r in raw_results:
+        if not isinstance(r, dict):
+            continue
+
+        url = r.get('url', '') or r.get('product_url', '')
+        if url and not url.startswith('http'):
+            url = f"{BASE_URL}{url}" if url.startswith('/') else f"{BASE_URL}/{url}"
+
+        name = r.get('name', '') or r.get('title', '')
+
+        price_val = None
+        raw_price = r.get('price', '') or r.get('sale_price', '')
+        if raw_price:
+            try:
+                price_val = float(raw_price)
+            except (ValueError, TypeError):
+                pass
+        price_text = f"${price_val:,.2f}" if price_val else None
+
+        image = r.get('thumbnailImageUrl', '') or r.get('imageUrl', '') or r.get('image', '')
+        if image and not image.startswith('http'):
+            image = f"{BASE_URL}{image}"
+
+        sku = r.get('sku', '') or r.get('uid', '')
+
+        description = r.get('description', '') or r.get('short_description', '')
+        if isinstance(description, list):
+            description = description[0] if description else ''
+        if description:
+            description = BeautifulSoup(description, 'html.parser').get_text(strip=True)
+            description = description[:MAX_DESCRIPTION_LENGTH]
+
+        availability = 'In Stock'
+        stock = r.get('instock', '') or r.get('ss_in_stock', '') or r.get('in_stock', '')
+        if isinstance(stock, str) and stock in ('0', 'false', 'no'):
+            availability = 'Out of Stock'
+        elif isinstance(stock, bool) and not stock:
+            availability = 'Out of Stock'
+        stock_msg = r.get('stockMessage', '')
+        if isinstance(stock_msg, str) and 'out of stock' in stock_msg.lower():
+            availability = 'Out of Stock'
+
+        if url and name:
+            products.append({
+                'url': url,
+                'name': name,
+                'price': price_text,
+                'priceNumeric': price_val,
+                'image': image or None,
+                'sku': str(sku) if sku else None,
+                'description': description or None,
+                'availability': availability,
+            })
+
+    return products
 
 
 def extract_listing_products(html: str, base_url: str) -> list[dict]:
@@ -91,7 +172,6 @@ def extract_listing_products(html: str, base_url: str) -> list[dict]:
     products = []
     seen = set()
 
-    # Strategy 1: WooCommerce product grid
     for item in soup.select('.product, .type-product, .product-item, .product-item-info'):
         link_el = item.select_one('a[href]')
         if not link_el:
@@ -125,38 +205,16 @@ def extract_listing_products(html: str, base_url: str) -> list[dict]:
         if name and len(name) > 3:
             products.append({'url': url, 'name': name, 'price': price, 'image': image})
 
-    # Strategy 2: Search results fallback
-    if not products:
-        for item in soup.select('[class*="search-result"], [class*="result-item"], li.product'):
-            link_el = item.select_one('a[href]')
-            if not link_el:
-                continue
-            url = urljoin(base_url, link_el.get('href', ''))
-            if url in seen or not validate_url(url):
-                continue
-            seen.add(url)
-
-            name = link_el.get_text(strip=True) or link_el.get('title', '')
-            parent = link_el.find_parent(['div', 'li', 'article'])
-            price_el = parent.select_one('[class*="price"]') if parent else None
-            price = price_el.get_text(strip=True) if price_el else None
-            img_el = parent.select_one('img[src]') if parent else None
-            image = img_el.get('src') if img_el else None
-
-            if name and len(name) > 3:
-                products.append({'url': url, 'name': name, 'price': price, 'image': image})
-
     return products
 
 
 def extract_product_details(html: str) -> dict:
+    import json
     soup = BeautifulSoup(html, 'html.parser')
 
-    # Name
     h1 = soup.select_one('h1')
     name = h1.get_text(strip=True) if h1 else None
 
-    # Price — try JSON-LD, itemprop, then WooCommerce selectors
     price_text = None
     price_numeric = None
 
@@ -207,14 +265,12 @@ def extract_product_details(html: str) -> dict:
                     price_text = prices[-1] if prices else price_text
                 price_numeric = parse_price(price_text)
 
-    # Image
     og_image = soup.select_one('meta[property="og:image"]')
     image_url = og_image.get('content') if og_image else None
     if not image_url:
         img_el = soup.select_one('.woocommerce-product-gallery img, .product-image img, img.wp-post-image')
         image_url = img_el.get('src') if img_el else None
 
-    # SKU
     sku = None
     for script in soup.select('script[type="application/ld+json"]'):
         try:
@@ -232,7 +288,6 @@ def extract_product_details(html: str) -> dict:
         if sku_el:
             sku = sku_el.get('content') or sku_el.get_text(strip=True)
 
-    # Availability
     availability = "Unknown"
     for script in soup.select('script[type="application/ld+json"]'):
         try:
@@ -271,7 +326,6 @@ def extract_product_details(html: str) -> dict:
                 availability = state
                 break
 
-    # Description
     desc_el = soup.select_one(
         '.woocommerce-product-details__short-description, '
         '[itemprop="description"], .product-short-description, '
@@ -309,6 +363,76 @@ def init_session(proxies: dict) -> Session:
         Actor.log.warning(f"Homepage returned {home_resp.status_code}, scraping may fail")
     http.headers.update({'Referer': f'{BASE_URL}/'})
     return http
+
+
+async def scrape_search(http: Session, query: str, proxies: dict, max_items: int) -> None:
+    """Scrape search results using the SearchSpring API."""
+    global products_scraped
+    page = 1
+    results_per_page = min(48, max_items - products_scraped)
+
+    while products_scraped < max_items:
+        products = search_searchspring(http, query, proxies, results_per_page=results_per_page, page=page)
+        if not products:
+            break
+
+        for product in products:
+            if products_scraped >= max_items:
+                break
+
+            prod_url = product['url'].rstrip('/')
+            if prod_url in scraped_urls:
+                continue
+            scraped_urls.add(prod_url)
+
+            # Try fetching full product page for detailed data
+            try:
+                prod_resp = http.get(prod_url, proxies=proxies, timeout=30)
+                if prod_resp.status_code == 200:
+                    details = extract_product_details(prod_resp.text)
+                    await Actor.push_data({
+                        'url': prod_url,
+                        'name': details['name'] or product.get('name', ''),
+                        'price': details['price'] or product.get('price'),
+                        'priceNumeric': details['priceNumeric'] or product.get('priceNumeric'),
+                        'imageUrl': details['imageUrl'] or product.get('image'),
+                        'sku': details['sku'] or product.get('sku'),
+                        'availability': details['availability'] if details['availability'] != 'Unknown' else product.get('availability', 'Unknown'),
+                        'description': details['description'] or product.get('description'),
+                        'scrapedAt': datetime.now(timezone.utc).isoformat(),
+                    })
+                else:
+                    Actor.log.warning(f"Product page {prod_url} returned {prod_resp.status_code}, using API data")
+                    await Actor.push_data({
+                        'url': prod_url,
+                        'name': product.get('name', ''),
+                        'price': product.get('price'),
+                        'priceNumeric': product.get('priceNumeric'),
+                        'imageUrl': product.get('image'),
+                        'sku': product.get('sku'),
+                        'availability': product.get('availability', 'In Stock'),
+                        'description': product.get('description'),
+                        'scrapedAt': datetime.now(timezone.utc).isoformat(),
+                    })
+            except Exception as e:
+                Actor.log.warning(f"Failed to fetch product {prod_url}: {e}, using API data")
+                await Actor.push_data({
+                    'url': prod_url,
+                    'name': product.get('name', ''),
+                    'price': product.get('price'),
+                    'priceNumeric': product.get('priceNumeric'),
+                    'imageUrl': product.get('image'),
+                    'sku': product.get('sku'),
+                    'availability': product.get('availability', 'In Stock'),
+                    'description': product.get('description'),
+                    'scrapedAt': datetime.now(timezone.utc).isoformat(),
+                })
+
+            products_scraped += 1
+            Actor.log.info(f"Scraped {products_scraped}/{max_items} products")
+
+        page += 1
+        results_per_page = min(48, max_items - products_scraped)
 
 
 async def scrape_listing(http: Session, url: str, proxies: dict, max_items: int) -> None:
@@ -429,13 +553,13 @@ async def main():
         search_terms = actor_input.get("search_terms", [])
         max_items = actor_input.get("max_items", 10)
 
+        search_queries = []
         start_urls = []
         for term in search_terms:
             term = term.strip()
             if term:
-                search_url = SEARCH_URL_TEMPLATE.format(query=quote_plus(term))
-                start_urls.append(search_url)
-                Actor.log.info(f"Added search term: '{term}' -> {search_url}")
+                search_queries.append(term)
+                Actor.log.info(f"Added search term: '{term}' (will use SearchSpring API)")
 
         for item in start_urls_input:
             if isinstance(item, dict) and "url" in item:
@@ -449,12 +573,12 @@ async def main():
             else:
                 Actor.log.warning(f"Skipping non-Provident Metals URL: {url}")
 
-        if not start_urls:
+        if not search_queries and not start_urls:
             default_term = "Silver coin"
-            start_urls = [SEARCH_URL_TEMPLATE.format(query=quote_plus(default_term))]
+            search_queries = [default_term]
             Actor.log.info(f"No input provided, defaulting to search: '{default_term}'")
 
-        Actor.log.info(f"Starting Provident Metals Scraper with {len(start_urls)} start URLs, max_items={max_items}")
+        Actor.log.info(f"Starting Provident Metals Scraper with {len(search_queries)} search queries, {len(start_urls)} start URLs, max_items={max_items}")
 
         Actor.log.info("Configuring RESIDENTIAL proxy with US country")
         proxy_configuration = await Actor.create_proxy_configuration(
@@ -470,11 +594,26 @@ async def main():
 
         http = init_session(proxies)
 
+        # Process search queries via SearchSpring API
+        for query in search_queries:
+            if products_scraped >= max_items:
+                break
+            Actor.log.info(f"Using SearchSpring API for query: '{query}'")
+            await scrape_search(http, query, proxies, max_items)
+
+        # Process start URLs
         for url in start_urls:
             if products_scraped >= max_items:
                 break
 
-            if is_search_url(url) or is_category_url(url):
+            if is_search_url(url):
+                parsed = urlparse(url)
+                qs = parse_qs(parsed.query)
+                query = qs.get('s', qs.get('q', ['']))[0]
+                if query:
+                    Actor.log.info(f"Using SearchSpring API for search URL query: '{query}'")
+                    await scrape_search(http, query, proxies, max_items)
+            elif is_category_url(url):
                 await scrape_listing(http, url, proxies, max_items)
             elif is_product_url(url):
                 await scrape_product(http, url, proxies, max_items)
